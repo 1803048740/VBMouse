@@ -7,5 +7,10 @@ python -m PyInstaller --noconfirm --clean --onedir --windowed --name BlueMouse `
   --collect-all pynput --collect-all customtkinter --collect-all pystray `
   --collect-all PIL --add-data "app\assets;assets" `
   app\bluemouse_app.py
+if ($LASTEXITCODE -ne 0) {
+    # PS5.1 不会因原生命令失败而中断, 必须显式检查, 否则会假报打包成功
+    Write-Error "PyInstaller 打包失败 (exit=$LASTEXITCODE)"
+    exit $LASTEXITCODE
+}
 Write-Host "`n打包完成: dist\BlueMouse\BlueMouse.exe"
 Write-Host "接着运行: powershell -ExecutionPolicy Bypass -File install.ps1"
