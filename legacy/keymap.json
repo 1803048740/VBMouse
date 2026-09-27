@@ -1,0 +1,7 @@
+{
+  "_说明": "键码来自 service.log 里的 [KEY] 行。action 可选: text=粘贴文本 / key=发送按键组合(如 ctrl+shift+p) / cmd=运行命令。改完在控制台输入 r 重载。注意: 音量/静音等系统已有行为的键不要绑定, 否则会双重触发。",
+  "0x0196": {
+    "action": "text",
+    "value": "（打开 keymap.json 配置我的动作）"
+  }
+}

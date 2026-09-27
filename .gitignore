@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 构建产物
+build/
+dist/
+installer_build/
+
+# 本地录音与日志(隐私数据, 一律不入库)
+*.wav
+*.log
+guilog.txt
+
+# 运行时本地配置(应用实际读写 %LOCALAPPDATA%\BlueMouse\)
+settings.json
