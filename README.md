@@ -25,6 +25,23 @@
   配置存于 `%LOCALAPPDATA%\BlueMouse\keymap.json`
 - **音量/静音/飞鼠/背面键盘**: 系统原生行为,不受影响
 
+## 语音识别(本地 / 云端)
+
+默认本地 faster-whisper small(int8, 纯离线)。界面右下角「识别设置」里可切换后端,
+换服务商/填 Key 后下一句语音即生效:
+
+| 后端 | 说明 |
+|---|---|
+| 本地 Whisper | 模型与设备可换: small / medium / large-v3, cpu / cuda(cuda 失败自动回退) |
+| Groq | whisper-large-v3-turbo, 有免费额度, OpenAI 兼容接口 |
+| SiliconFlow 硅基流动 | SenseVoiceSmall, 中文友好, 免费 |
+| MiniMax | 语音识别 API(api.minimaxi.com) |
+| 火山引擎 | 豆包大模型录音文件识别极速版, 需在控制台拿 AppID + Access Token |
+
+- `keymap.json` / `settings.json` 的手工修改会**即时热加载**, 不用重启应用
+  (界面里保存绑定同样即时生效)
+- API Key 只存本机 `%LOCALAPPDATA%\BlueMouse\settings.json`, 不入仓库
+
 ## 实现要点(踩坑记录)
 
 1. 接收器是 USB 复合设备(VID_1915 北欧芯片): 接口0=USB 声卡,接口2/3=HID。
@@ -42,6 +59,7 @@
   (keymap.json / settings.json / app.log / last_utterance.wav)
 - 界面里"日志目录"按钮直达
 - 重新打包: `powershell -ExecutionPolicy Bypass -File build.ps1` → `dist\BlueMouse\`
+- 云端 STT 冒烟测试: `python -X utf8 tools/test_stt_smoke.py`(mock 网络, 不发真实请求)
 - 卸载(若运行过 install.ps1): 开始菜单"卸载 BlueMouse"或 `uninstall.ps1`
 
 ## 识别质量升级路线

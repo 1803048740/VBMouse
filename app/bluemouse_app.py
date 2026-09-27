@@ -1,10 +1,14 @@
-"""BlueMouse 遥控中心 v1.1 - 双遥控器档案 + 按键学习 + 可安装/绿色版。
+"""BlueMouse 遥控中心 v1.2 - 双档案 + 按键学习 + 本地/云端语音识别。
 
 - 界面顶部切换遥控器档案(G20 款 / Apple TV 款), 各自独立绑定
 - 按键学习: 按下遥控器上任意键(消费通道或系统键), 界面显示码值并可绑定/设为语音键
 - 语音键: 按一下开始说话, 再按一下结束 (settings.json ptt_mode=vad 切回自动断句)
+- 语音识别: 本地 faster-whisper(cpu/cuda) 或云端 API(Groq/SiliconFlow/MiniMax/火山引擎),
+  界面「识别设置」里配置; keymap.json / settings.json 手工改动会自动热加载
 - 麦克风: 自动打开所有 Mic Device 端点, 录音时自动选用最响的一路(支持多接收器)
 """
+import base64
+import io
 import json
 import multiprocessing as mp
 import os
@@ -98,6 +102,46 @@ def save_json(path, obj):
 km_data = {}
 settings = {}
 
+DEFAULT_SETTINGS = {
+    "autostart": False, "warmup_model": True, "ptt_mode": "toggle",
+    # 语音识别
+    "stt_backend": "local",      # local=本地 Whisper / api=云端 API
+    "local_model": "small",      # small / medium / large-v3 / distil-medium.en ...
+    "local_device": "cpu",       # cpu / cuda (cuda 失败自动回退 cpu)
+    "api_provider": "groq",      # groq / siliconflow / minimax / volc / custom
+    "api_key": "",
+    "api_base": "",              # 留空用服务商预设, 可覆盖
+    "api_model": "",             # 留空用服务商预设, 可覆盖
+    "volc_appid": "",            # 火山引擎 AppID
+    "volc_token": "",            # 火山引擎 Access Token
+}
+
+# 云端服务商预设: OpenAI 兼容 /audio/transcriptions, 火山走专用适配
+API_PRESETS = {
+    "groq": {"label": "Groq (免费额度, whisper-large-v3-turbo)",
+             "base": "https://api.groq.com/openai/v1",
+             "model": "whisper-large-v3-turbo"},
+    "siliconflow": {"label": "SiliconFlow 硅基流动 (SenseVoice 中文免费)",
+                    "base": "https://api.siliconflow.cn/v1",
+                    "model": "FunAudioLLM/SenseVoiceSmall"},
+    "minimax": {"label": "MiniMax (语音识别)",
+                "base": "https://api.minimaxi.com/v1",
+                "model": ""},
+    "volc": {"label": "火山引擎 (豆包录音文件识别极速版)",
+             "base": "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",
+             "model": ""},
+    "custom": {"label": "自定义 (OpenAI 兼容)", "base": "", "model": ""},
+}
+
+cfg_mtime = {"km": 0.0, "st": 0.0}
+
+
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
 
 def load_all():
     global km_data, settings
@@ -109,11 +153,23 @@ def load_all():
         raw = v2
         log("keymap.json 已迁移到 v2 双档案格式")
     km_data = raw
-    settings = {**{"autostart": False, "warmup_model": True, "ptt_mode": "toggle"},
-                **load_json(SETTINGS_FILE, {"autostart": False,
-                                            "warmup_model": True,
-                                            "ptt_mode": "toggle"})}
+    settings = {**DEFAULT_SETTINGS, **load_json(SETTINGS_FILE, DEFAULT_SETTINGS)}
     set_autostart(settings.get("autostart", False))
+    cfg_mtime["km"], cfg_mtime["st"] = _mtime(KEYMAP_FILE), _mtime(SETTINGS_FILE)
+
+
+def config_changed():
+    """检测 keymap.json / settings.json 是否被外部修改(含界面保存), 有则热加载。"""
+    changed = []
+    for tag, path in (("km", KEYMAP_FILE), ("st", SETTINGS_FILE)):
+        m = _mtime(path)
+        if m != cfg_mtime[tag]:
+            cfg_mtime[tag] = m
+            changed.append(tag)
+    if changed:
+        load_all()
+        log("配置文件已重新加载: " + ", ".join(changed))
+    return changed
 
 
 def active_profile():
@@ -123,6 +179,12 @@ def active_profile():
 
 def save_keymap():
     save_json(KEYMAP_FILE, km_data)
+    cfg_mtime["km"] = _mtime(KEYMAP_FILE)   # 界面保存不算外部修改
+
+
+def save_settings():
+    save_json(SETTINGS_FILE, settings)
+    cfg_mtime["st"] = _mtime(SETTINGS_FILE)
 
 
 def set_autostart(enable):
@@ -335,30 +397,122 @@ def syskey_loop(app):
 
 
 # ---------------- STT (独立进程, 不阻塞界面) ----------------
-def stt_worker(task_q, result_q):
-    """识别工作进程: 启动即加载模型, 循环处理音频任务。"""
-    from faster_whisper import WhisperModel
-    model = WhisperModel("small", device="cpu", compute_type="int8")
-    result_q.put({"event": "ready"})
+def wav_bytes(mono, sr):
+    """float32 单声道 -> 16bit PCM wav 字节(云端上传用)。"""
+    pcm = (np.clip(mono, -1, 1) * 32767).astype("<i2")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
 
-    def transcribe(mono, sr):
+
+def api_transcribe(mono, sr, cfg):
+    """云端识别入口: OpenAI 兼容服务商 + 火山引擎专用适配。"""
+    import requests
+    prov = cfg.get("api_provider") or "groq"
+    preset = API_PRESETS.get(prov) or API_PRESETS["custom"]
+    if prov == "volc":
+        return volc_transcribe(mono, sr, cfg)
+    base = (cfg.get("api_base") or preset["base"]).rstrip("/")
+    if not base:
+        raise RuntimeError("未配置 API 地址")
+    model = (cfg.get("api_model") or preset.get("model") or "").strip()
+    key = (cfg.get("api_key") or "").strip()
+    if not key:
+        raise RuntimeError(f"{preset['label']}: 未填 API Key")
+    r = requests.post(
+        base + "/audio/transcriptions",
+        headers={"Authorization": f"Bearer {key}"},
+        files={"file": ("utterance.wav", wav_bytes(mono, sr), "audio/wav")},
+        data={"model": model} if model else {},
+        timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"{preset['label']} HTTP {r.status_code}: {r.text[:200]}")
+    j = r.json()
+    text = j.get("text") or (j.get("result") or {}).get("text") or ""
+    return text.strip()
+
+
+def volc_transcribe(mono, sr, cfg):
+    """火山引擎大模型录音文件识别极速版(同步, base64 wav 直传)。"""
+    import requests
+    appid = (cfg.get("volc_appid") or "").strip()
+    token = (cfg.get("volc_token") or "").strip()
+    if not appid or not token:
+        raise RuntimeError("火山引擎: 未填 AppID / Access Token")
+    url = cfg.get("api_base") or API_PRESETS["volc"]["base"]
+    r = requests.post(url, timeout=60, json={
+        "user": {"uid": APP_NAME},
+        "audio": {"format": "wav",
+                  "data": base64.b64encode(wav_bytes(mono, sr)).decode()},
+        "request": {"model_name": "bigmodel", "enable_punc": True},
+    }, headers={"X-Api-App-Key": appid,
+                "X-Api-Access-Key": token,
+                "X-Api-Resource-Id": "volc.bigasr.auc.duration"})
+    if r.status_code != 200:
+        raise RuntimeError(f"火山引擎 HTTP {r.status_code}: {r.text[:200]}")
+    j = r.json()
+    text = (j.get("result") or {}).get("text") or ""
+    return text.strip()
+
+
+def stt_worker(task_q, result_q):
+    """识别工作进程: 本地模型按配置懒加载/热切换, 云端直接调 API。"""
+    model = [None, None]     # [WhisperModel, 指纹(模型,设备)]
+
+    def get_local(cfg):
+        fp = (cfg.get("local_model") or "small", cfg.get("local_device") or "cpu")
+        if model[0] is not None and model[1] == fp:
+            return model[0]
+        if model[0] is not None:
+            del model[0]
+        from faster_whisper import WhisperModel
+        dev, ct = fp[1], "int8"
+        if dev == "cuda":
+            ct = "float16"
+            try:
+                model[0] = WhisperModel(fp[0], device="cuda", compute_type=ct)
+                model[1] = fp
+                return model[0]
+            except Exception:
+                dev = "cpu"   # 无 N 卡/驱动异常 -> 自动回退 CPU
+        model[0] = WhisperModel(fp[0], device=dev, compute_type=ct)
+        model[1] = (fp[0], dev)
+        return model[0]
+
+    def transcribe_local(cfg, mono, sr):
         n16 = int(len(mono) * 16000 / sr)
         x = np.linspace(0, 1, len(mono), endpoint=False)
         xi = np.linspace(0, 1, n16, endpoint=False)
         p16 = np.interp(xi, x, mono).astype(np.float32)
         p16 = p16 / (float(np.abs(p16).max()) or 1.0) * 0.9
-        segs, _ = model.transcribe(p16, language="zh", beam_size=5,
-                                   condition_on_previous_text=False,
-                                   initial_prompt="以下是普通话口述的编程指令。")
+        segs, _ = get_local(cfg).transcribe(
+            p16, language="zh", beam_size=5,
+            condition_on_previous_text=False,
+            initial_prompt="以下是普通话口述的编程指令。")
         return "".join(s.text for s in segs).strip()
 
+    result_q.put({"event": "ready"})
     while True:
         item = task_q.get()
         if item is None:
             break
         try:
+            cfg = item.get("cfg", {})
+            if item.get("warmup"):
+                if cfg.get("stt_backend", "local") == "local":
+                    get_local(cfg)
+                result_q.put({"event": "ready"})
+                continue
             mono = np.frombuffer(item["audio"], dtype=np.float32)
-            result_q.put({"event": "text", "text": transcribe(mono, item["sr"])})
+            if cfg.get("stt_backend", "local") == "api":
+                text = api_transcribe(mono, item["sr"], cfg)
+            else:
+                text = transcribe_local(cfg, mono, item["sr"])
+            result_q.put({"event": "text", "text": text})
         except Exception as e:
             result_q.put({"event": "error", "text": str(e)})
 
@@ -381,7 +535,7 @@ def ensure_stt():
 
 def stt_request(mono, sr, timeout=180.0):
     ensure_stt()
-    _stt["task"].put({"audio": mono.tobytes(), "sr": sr})
+    _stt["task"].put({"audio": mono.tobytes(), "sr": sr, "cfg": dict(settings)})
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -532,8 +686,10 @@ def record_vad(cap):
 
 # ---------------- 后台线程 ----------------
 def ptt_loop(app):
-    if settings.get("warmup_model", True):
+    if settings.get("stt_backend", "local") == "local" \
+            and settings.get("warmup_model", True):
         ensure_stt()
+        _stt["task"].put({"warmup": True, "cfg": dict(settings)})
     log("语音输入就绪 (toggle: 按一下开始/再按一下结束)")
     while not stop_all.is_set():
         voice_key_evt.wait()
@@ -656,7 +812,7 @@ ACTION_LABELS = [("none", "无(保持原生行为)"), ("text", "粘贴文本"),
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title(f"{APP_NAME} 遥控中心 v1.1")
+        self.title(f"{APP_NAME} 遥控中心 v1.2")
         self.geometry("980x700")
         self.minsize(920, 640)
         self.kbc = pk.Controller()
@@ -721,6 +877,8 @@ class App(ctk.CTk):
         self.warmup_var = ctk.BooleanVar(value=settings.get("warmup_model", True))
         ctk.CTkSwitch(bottom, text="预热模型", command=self.toggle_warmup,
                       variable=self.warmup_var, width=90).pack(side="left", padx=6)
+        ctk.CTkButton(bottom, text="识别设置", width=80, fg_color="#3a3a44",
+                      command=self.open_stt_settings).pack(side="left", padx=4)
         ctk.CTkButton(bottom, text="日志目录", width=80, fg_color="#3a3a44",
                       command=lambda: os.startfile(DATA_DIR)).pack(side="left", padx=4)
 
@@ -741,8 +899,6 @@ class App(ctk.CTk):
         self.draw_remote()
 
     def load_remote_images(self):
-        import base64
-        from io import BytesIO
         self._photos = {}
         base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
         for aid, file in (("A", "remoteA.png"), ("B", "remoteB.png")):
@@ -754,7 +910,7 @@ class App(ctk.CTk):
             h = 540
             w = max(1, int(img.width * h / img.height))
             img = img.resize((w, h), Image.LANCZOS)
-            b = BytesIO()
+            b = io.BytesIO()
             img.save(b, "PNG")
             self._photos[aid] = (tk.PhotoImage(data=base64.b64encode(b.getvalue())), w, h)
 
@@ -938,7 +1094,7 @@ class App(ctk.CTk):
 
     def toggle_autostart(self):
         settings["autostart"] = bool(self.autostart_var.get())
-        save_json(SETTINGS_FILE, settings)
+        save_settings()
         try:
             set_autostart(settings["autostart"])
             log(f"开机自启: {settings['autostart']}")
@@ -947,8 +1103,119 @@ class App(ctk.CTk):
 
     def toggle_warmup(self):
         settings["warmup_model"] = bool(self.warmup_var.get())
-        save_json(SETTINGS_FILE, settings)
-        log(f"预热模型: {settings['warmup_model']} (重启应用后生效)")
+        save_settings()
+        log(f"预热模型: {settings['warmup_model']}")
+
+    # ----- 识别设置对话框 -----
+    def open_stt_settings(self):
+        win = ctk.CTkToplevel(self)
+        win.title("识别设置")
+        win.geometry("600x600")
+        win.transient(self)
+        win.after(120, win.grab_set)
+        pad = {"padx": 18, "anchor": "w"}
+
+        ctk.CTkLabel(win, text="识别后端", font=("Microsoft YaHei", 13, "bold")
+                     ).pack(**pad, pady=(14, 2))
+        backend_var = ctk.StringVar(value=settings.get("stt_backend", "local"))
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(**pad)
+        ctk.CTkRadioButton(row, text="本地 Whisper (离线)", variable=backend_var,
+                           value="local").pack(side="left", padx=(0, 18))
+        ctk.CTkRadioButton(row, text="云端 API (需联网)", variable=backend_var,
+                           value="api").pack(side="left")
+
+        ctk.CTkLabel(win, text="本地模型 (cpu / 有 N 卡选 cuda, cuda 失败自动回退)",
+                     font=("Microsoft YaHei", 13, "bold")).pack(**pad, pady=(12, 2))
+        local_row = ctk.CTkFrame(win, fg_color="transparent")
+        local_row.pack(**pad)
+        model_var = ctk.StringVar(value=settings.get("local_model", "small"))
+        ctk.CTkComboBox(local_row, width=200,
+                        values=["small", "medium", "large-v3", "large-v3-turbo"],
+                        variable=model_var).pack(side="left")
+        dev_var = ctk.StringVar(value=settings.get("local_device", "cpu"))
+        ctk.CTkComboBox(local_row, width=90, values=["cpu", "cuda"],
+                        variable=dev_var).pack(side="left", padx=8)
+
+        ctk.CTkLabel(win, text="云端服务商", font=("Microsoft YaHei", 13, "bold")
+                     ).pack(**pad, pady=(12, 2))
+        key_by_label = {p["label"]: k for k, p in API_PRESETS.items()}
+        prov_var = ctk.StringVar(
+            value=API_PRESETS.get(settings.get("api_provider", "groq"),
+                                  API_PRESETS["groq"])["label"])
+        base_var = ctk.StringVar(value=settings.get("api_base", ""))
+        model_api_var = ctk.StringVar(value=settings.get("api_model", ""))
+
+        def pick_prov(label):
+            p = API_PRESETS.get(key_by_label.get(label, "custom"),
+                                API_PRESETS["custom"])
+            base_var.set(p["base"])
+            model_api_var.set(p["model"])
+
+        ctk.CTkOptionMenu(win, width=520, values=list(key_by_label),
+                          variable=prov_var, command=pick_prov).pack(**pad, pady=2)
+
+        ctk.CTkLabel(win, text="API Key (火山引擎不用这个, 用下面两栏)",
+                     anchor="w", text_color="#9aa0a6").pack(**pad, pady=(8, 0))
+        key_var = ctk.StringVar(value=settings.get("api_key", ""))
+        ctk.CTkEntry(win, width=520, show="*", variable=key_var).pack(**pad, pady=2)
+        ctk.CTkLabel(win, text="API 地址(留空用预设) / 模型名(留空用预设)",
+                     anchor="w", text_color="#9aa0a6").pack(**pad, pady=(8, 0))
+        addr_row = ctk.CTkFrame(win, fg_color="transparent")
+        addr_row.pack(**pad, pady=2)
+        ctk.CTkEntry(addr_row, width=300, textvariable=base_var).pack(side="left")
+        ctk.CTkEntry(addr_row, width=210, placeholder_text="模型名",
+                     textvariable=model_api_var).pack(side="left", padx=8)
+
+        ctk.CTkLabel(win, text="火山引擎 AppID / Access Token (极速版录音文件识别)",
+                     anchor="w", text_color="#9aa0a6").pack(**pad, pady=(8, 0))
+        volc_row = ctk.CTkFrame(win, fg_color="transparent")
+        volc_row.pack(**pad, pady=2)
+        appid_var = ctk.StringVar(value=settings.get("volc_appid", ""))
+        tok_var = ctk.StringVar(value=settings.get("volc_token", ""))
+        ctk.CTkEntry(volc_row, width=240, placeholder_text="AppID",
+                     textvariable=appid_var).pack(side="left")
+        ctk.CTkEntry(volc_row, width=270, placeholder_text="Access Token", show="*",
+                     textvariable=tok_var).pack(side="left", padx=8)
+
+        ctk.CTkLabel(win, text="免费推荐: Groq (whisper-large-v3-turbo) 或\n"
+                              "SiliconFlow (SenseVoiceSmall, 中文友好, 免费)。\n"
+                              "火山引擎: 控制台开通「大模型录音文件识别极速版」后\n"
+                              "在应用管理里拿 AppID + Access Token。",
+                     justify="left", text_color="#9aa0a6").pack(**pad, pady=(10, 0))
+
+        def do_save():
+            settings["stt_backend"] = backend_var.get()
+            settings["local_model"] = model_var.get().strip() or "small"
+            settings["local_device"] = dev_var.get().strip() or "cpu"
+            settings["api_provider"] = key_by_label.get(prov_var.get(), "groq")
+            settings["api_key"] = key_var.get().strip()
+            settings["api_base"] = base_var.get().strip()
+            settings["api_model"] = model_api_var.get().strip()
+            settings["volc_appid"] = appid_var.get().strip()
+            settings["volc_token"] = tok_var.get().strip()
+            save_settings()
+            log(f"识别设置已保存: backend={settings['stt_backend']}"
+                + (f", {settings['api_provider']}" if settings["stt_backend"] == "api"
+                   else f", {settings['local_model']}/{settings['local_device']}"))
+            self.panel_hint.configure(text="✅ 识别设置已保存, 下一句语音即生效",
+                                      text_color="#7ee787")
+            win.destroy()
+
+        ctk.CTkButton(win, text="保存", width=140, command=do_save).pack(pady=14)
+
+    def reload_config(self, km_changed):
+        """配置文件被外部修改后的热加载。"""
+        self.autostart_var.set(bool(settings.get("autostart", False)))
+        self.warmup_var.set(bool(settings.get("warmup_model", True)))
+        if km_changed:
+            for w in self.bind_frame.winfo_children():
+                w.destroy()
+            self.panel_title.configure(text="配置已从磁盘重新加载")
+            self.panel_hint.configure(text="keymap.json 被修改并已热加载, 点击左侧按键继续绑定。",
+                                      text_color="#8ab4f8")
+            self.profile_var.set(active_profile()[1]["name"])
+            self.draw_remote()
 
     def hide_to_tray(self):
         self.withdraw()
@@ -956,6 +1223,9 @@ class App(ctk.CTk):
 
 
 def poll_gui(app):
+    changed = config_changed()
+    if changed:
+        app.reload_config("km" in changed)
     if app.show_req[0]:
         app.show_req[0] = False
         app.deiconify()
